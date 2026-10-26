@@ -65,6 +65,7 @@ pub(crate) fn build_table_context(
     drop(stylo_styles);
 
     let mut column_sizes: Vec<taffy::Dimension> = Vec::new();
+    let mut row_spans = RowSpans::default();
     for child_id in children.iter().copied() {
         collect_table_cells(
             doc,
@@ -74,8 +75,11 @@ pub(crate) fn build_table_context(
             &mut col,
             &mut items,
             &mut column_sizes,
+            &mut row_spans,
         );
     }
+    // Rows outside any row group end with the table.
+    row_spans.end_group(&mut items, row);
     column_sizes.resize(col as usize, style_helpers::auto());
 
     style.grid_template_columns = column_sizes
@@ -95,6 +99,52 @@ pub(crate) fn build_table_context(
     (TableContext { style, items }, layout_children)
 }
 
+/// The cells of the current row group that span more than one row.
+#[derive(Debug, Default)]
+pub(crate) struct RowSpans {
+    /// For each column, the last row that a cell from an earlier row covers.
+    covered_through: Vec<u16>,
+    /// `(item index, first row, rowspan)` of each spanning cell.
+    cells: Vec<(usize, u16, u16)>,
+}
+
+impl RowSpans {
+    /// The first column at or after `col` that no cell of an earlier row
+    /// covers in `row`.
+    fn free_column(&self, row: u16, mut col: u16) -> u16 {
+        while self
+            .covered_through
+            .get(col as usize)
+            .is_some_and(|&last| last >= row)
+        {
+            col += 1;
+        }
+        col
+    }
+
+    /// Records the cell at `item` covering `columns` from `row` down
+    /// `rowspan` rows.
+    fn span(&mut self, item: usize, row: u16, columns: Range<u16>, rowspan: u16) {
+        let last = row.saturating_add(rowspan - 1);
+        if self.covered_through.len() < columns.end as usize {
+            self.covered_through.resize(columns.end as usize, 0);
+        }
+        for col in columns {
+            self.covered_through[col as usize] = last;
+        }
+        self.cells.push((item, row, rowspan));
+    }
+
+    /// Ends a row group whose last row is `last_row`: each spanning cell
+    /// spans its rows up to the group's end, and no later row is covered.
+    fn end_group(&mut self, items: &mut [TableItem], last_row: u16) {
+        for (item, row, rowspan) in self.cells.drain(..) {
+            items[item].style.grid_row.end = style_helpers::span(rowspan.min(last_row - row + 1));
+        }
+        self.covered_through.clear();
+    }
+}
+
 pub(crate) fn collect_table_cells(
     doc: &mut BaseDocument,
     node_id: usize,
@@ -103,6 +153,7 @@ pub(crate) fn collect_table_cells(
     col: &mut u16,
     cells: &mut Vec<TableItem>,
     columns: &mut Vec<Dimension>,
+    row_spans: &mut RowSpans,
 ) {
     let node = &doc.nodes[node_id];
 
@@ -129,9 +180,13 @@ pub(crate) fn collect_table_cells(
             for child_id in children.iter().copied() {
                 doc.nodes[child_id]
                     .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns);
+                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns, row_spans);
             }
             doc.nodes[node_id].children = children;
+            // A row span ends with its row group (css-tables-3).
+            if display.inside() != DisplayInside::Contents {
+                row_spans.end_group(cells, *row);
+            }
         }
         DisplayInside::TableRow => {
             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -158,9 +213,11 @@ pub(crate) fn collect_table_cells(
 
             let children = std::mem::take(&mut doc.nodes[node_id].children);
             for child_id in children.iter().copied() {
-                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns);
+                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns, row_spans);
             }
             doc.nodes[node_id].children = children;
+            // Count the columns that spans from above cover at the row's end.
+            *col = row_spans.free_column(*row, *col);
         }
         DisplayInside::TableCell => {
             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -169,6 +226,15 @@ pub(crate) fn collect_table_cells(
                 .attr(local_name!("colspan"))
                 .and_then(|val| val.parse().ok())
                 .unwrap_or(1);
+            // Clamped as the HTML Standard does; `rowspan="0"` is read as 1.
+            let rowspan: u16 = node
+                .attr(local_name!("rowspan"))
+                .and_then(|val| val.parse::<u16>().ok())
+                .map(|v| v.clamp(1, 65534))
+                .unwrap_or(1);
+            // A cell starts at the first column no cell of an earlier row
+            // spans into.
+            *col = row_spans.free_column(*row, *col);
             let mut style = stylo_taffy::to_taffy_style(stylo_style);
 
             // TODO: account for padding/border/margin
@@ -210,6 +276,9 @@ pub(crate) fn collect_table_cells(
                 end: style_helpers::span(1),
             };
             style.size.width = style_helpers::auto();
+            if rowspan > 1 {
+                row_spans.span(cells.len(), *row, *col..*col + colspan, rowspan);
+            }
             cells.push(TableItem {
                 kind: TableItemKind::Cell,
                 node_id,
@@ -331,5 +400,39 @@ impl taffy::LayoutGridContainer for TableTreeWrapper<'_> {
 
     fn get_grid_child_style(&self, child_node_id: taffy::NodeId) -> Self::GridItemStyle<'_> {
         &self.ctx.items[usize::from(child_node_id)].style
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell() -> TableItem {
+        TableItem {
+            kind: TableItemKind::Cell,
+            node_id: 0,
+            style: taffy::Style::default(),
+        }
+    }
+
+    #[test]
+    fn a_cell_skips_the_columns_a_cell_of_an_earlier_row_spans_into() {
+        let mut spans = RowSpans::default();
+        spans.span(0, 1, 1..3, 2);
+        assert_eq!(spans.free_column(2, 0), 0);
+        assert_eq!(spans.free_column(2, 1), 3);
+        assert_eq!(spans.free_column(3, 1), 1);
+    }
+
+    #[test]
+    fn a_row_span_ends_with_its_row_group() {
+        let mut items = vec![cell(), cell()];
+        let mut spans = RowSpans::default();
+        spans.span(0, 1, 0..1, 5);
+        spans.span(1, 2, 1..2, 2);
+        spans.end_group(&mut items, 3);
+        assert_eq!(items[0].style.grid_row.end, style_helpers::span(3));
+        assert_eq!(items[1].style.grid_row.end, style_helpers::span(2));
+        assert_eq!(spans.free_column(4, 0), 0);
     }
 }
