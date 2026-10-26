@@ -293,6 +293,17 @@ impl LayoutPartialTree for BaseDocument {
                             doc: tree,
                             ctx: context,
                         };
+                        // Block layout lays its children out at min-content
+                        // height, where the grid has no free space to maximise
+                        // its rows into. Taffy distributes the extra height of
+                        // a cell spanning rows only to the rows' growth
+                        // limits, so without maximising the rows a spanning
+                        // cell taller than them overflows the table. A table's
+                        // height is its content's either way.
+                        let mut inputs = inputs;
+                        if inputs.available_space.height == AvailableSpace::MinContent {
+                            inputs.available_space.height = AvailableSpace::MaxContent;
+                        }
                         return compute_grid_layout(&mut table_wrapper, node_id, inputs);
                     }
 
