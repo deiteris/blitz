@@ -4,8 +4,8 @@ use markup5ever::local_name;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::{Atom, computed_values::table_layout::T as TableLayout};
 use taffy::{
-    Dimension, LayoutPartialTree as _, ResolveOrZero, TrackSizingFunction, compute_leaf_layout,
-    style_helpers,
+    Dimension, LayoutPartialTree as _, MaxTrackSizingFunction, MinTrackSizingFunction,
+    ResolveOrZero, TrackSizingFunction, compute_leaf_layout, style_helpers,
 };
 
 use crate::{BaseDocument, Node};
@@ -64,13 +64,12 @@ pub(crate) fn build_table_context(
 
     drop(stylo_styles);
 
-    let mut column_sizes = ColumnWidths::default();
+    let mut column_sizes = ColumnWidths::new(is_fixed);
     let mut row_spans = RowSpans::default();
     for child_id in children.iter().copied() {
         collect_table_cells(
             doc,
             child_id,
-            is_fixed,
             &mut row,
             &mut col,
             &mut items,
@@ -81,9 +80,9 @@ pub(crate) fn build_table_context(
     // Rows outside any row group end with the table.
     row_spans.end_group(&mut items, row);
     style.grid_template_columns = column_sizes
-        .into_tracks(col)
+        .into_tracks()
         .into_iter()
-        .map(|dim| TrackSizingFunction::from(dim).into())
+        .map(Into::into)
         .collect();
     style.grid_template_rows = vec![style_helpers::auto(); row as usize];
 
@@ -99,51 +98,118 @@ pub(crate) fn build_table_context(
 }
 
 /// The width of each column: its column element's (`col`, or a
-/// `colgroup` without `col` children), or else that of the first-row cell
+/// `colgroup` without `col` children) and that of the first-row cell
 /// starting in it (CSS 2.1 §17.5.2).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ColumnWidths {
+    /// Whether the table's layout is fixed.
+    fixed: bool,
     /// Each column's width, `auto` where none is set.
     widths: Vec<Dimension>,
+    /// The most columns a row reaches.
+    columns: u16,
 }
 
 impl ColumnWidths {
+    fn new(fixed: bool) -> Self {
+        Self {
+            fixed,
+            widths: Vec::new(),
+            columns: 0,
+        }
+    }
+
     /// Adds the `span` columns of a column element whose `width` is `width`.
     fn add_columns(&mut self, width: Dimension, span: u16) {
         self.widths
             .extend(std::iter::repeat_n(width, usize::from(span)));
     }
 
-    /// Sizes the column at `col` by a cell of the first row, unless a column
-    /// element sized it.
+    /// Sizes the column at `col` by a cell of the first row: in the fixed
+    /// layout only where no column element sized it, in the automatic
+    /// layout to the wider of the two.
     fn first_row_cell(&mut self, col: u16, width: Dimension) {
         let col = usize::from(col);
         if self.widths.len() <= col {
             self.widths.resize(col + 1, style_helpers::auto());
         }
-        if self.widths[col].is_auto() {
-            self.widths[col] = width;
+        let column = &mut self.widths[col];
+        *column = if self.fixed && !column.is_auto() {
+            *column
+        } else {
+            wider(*column, width)
+        };
+    }
+
+    /// Widens the column at `col` to a later row's cell `len` wide, in the
+    /// automatic layout.
+    fn later_row_cell(&mut self, col: u16, len: f32) {
+        if self.fixed {
+            return;
+        }
+        if let Some(column) = self.widths.get_mut(usize::from(col)) {
+            *column = wider(*column, style_helpers::length(len));
         }
     }
 
-    /// Widens the column at `col` to a later row's cell `len` wide, in
-    /// automatic table layout; a percentage column keeps its width.
-    fn later_row_cell(&mut self, col: u16, len: f32) {
-        let Some(width) = self.widths.get_mut(usize::from(col)) else {
-            return;
-        };
-        *width = match width.tag() {
-            taffy::CompactLength::LENGTH_TAG => style_helpers::length(width.value().max(len)),
-            taffy::CompactLength::AUTO_TAG => style_helpers::length(len),
-            _ => *width,
-        };
+    /// Records that a row reaches `columns` columns.
+    fn end_row(&mut self, columns: u16) {
+        self.columns = self.columns.max(columns);
     }
 
-    /// The tracks of a table of `count` columns.
-    fn into_tracks(mut self, count: u16) -> Vec<Dimension> {
+    /// The column tracks: one for each column a row or a column element
+    /// makes. Percentages past 100% are cut from the last columns.
+    ///
+    /// In the automatic layout, when every column has a percentage, a
+    /// column takes its share of the table and grows to its cells'
+    /// min-content width, the others sharing the rest by their percentages:
+    /// each track is `minmax(min-content, <percentage>fr)`, in percent
+    /// since flex factors that sum below 1 leave space free. Otherwise each
+    /// column has exactly its width. A track `minmax(min-content, <width>)`
+    /// would grow past its width: Taffy 0.9's `distribute_space_up_to_limits`
+    /// measures a track's room to its limit without the increase earlier
+    /// rounds gave it.
+    fn into_tracks(mut self) -> Vec<TrackSizingFunction> {
+        let count = self.widths.len().max(usize::from(self.columns));
+        self.widths.resize(count, style_helpers::auto());
+        let mut percent_left = 1.0f32;
+        for width in &mut self.widths {
+            if width.tag() == taffy::CompactLength::PERCENT_TAG {
+                let percent = width.value().min(percent_left);
+                percent_left -= percent;
+                *width = Dimension::percent(percent);
+            }
+        }
+        let shares = !self.fixed
+            && self
+                .widths
+                .iter()
+                .all(|width| width.tag() == taffy::CompactLength::PERCENT_TAG);
         self.widths
-            .resize(usize::from(count), style_helpers::auto());
-        self.widths
+            .into_iter()
+            .map(|width| {
+                if shares {
+                    style_helpers::minmax(
+                        MinTrackSizingFunction::min_content(),
+                        MaxTrackSizingFunction::fr(width.value() * 100.0),
+                    )
+                } else {
+                    TrackSizingFunction::from(width)
+                }
+            })
+            .collect()
+    }
+}
+
+/// The wider of two column widths; a percentage is wider than a length.
+fn wider(a: Dimension, b: Dimension) -> Dimension {
+    const AUTO: usize = taffy::CompactLength::AUTO_TAG;
+    const LENGTH: usize = taffy::CompactLength::LENGTH_TAG;
+    const PERCENT: usize = taffy::CompactLength::PERCENT_TAG;
+    match (a.tag(), b.tag()) {
+        (AUTO, _) | (LENGTH, PERCENT) => b,
+        (LENGTH, LENGTH) | (PERCENT, PERCENT) if b.value() > a.value() => b,
+        _ => a,
     }
 }
 
@@ -196,7 +262,6 @@ impl RowSpans {
 pub(crate) fn collect_table_cells(
     doc: &mut BaseDocument,
     node_id: usize,
-    is_fixed: bool,
     row: &mut u16,
     col: &mut u16,
     cells: &mut Vec<TableItem>,
@@ -228,7 +293,7 @@ pub(crate) fn collect_table_cells(
             for child_id in children.iter().copied() {
                 doc.nodes[child_id]
                     .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns, row_spans);
+                collect_table_cells(doc, child_id, row, col, cells, columns, row_spans);
             }
             doc.nodes[node_id].children = children;
             // A row span ends with its row group (css-tables-3).
@@ -261,11 +326,12 @@ pub(crate) fn collect_table_cells(
 
             let children = std::mem::take(&mut doc.nodes[node_id].children);
             for child_id in children.iter().copied() {
-                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns, row_spans);
+                collect_table_cells(doc, child_id, row, col, cells, columns, row_spans);
             }
             doc.nodes[node_id].children = children;
             // Count the columns that spans from above cover at the row's end.
             *col = row_spans.free_column(*row, *col);
+            columns.end_row(*col);
         }
         DisplayInside::TableCell => {
             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -300,7 +366,7 @@ pub(crate) fn collect_table_cells(
                     _ => unreachable!(),
                 };
                 columns.first_row_cell(*col, column);
-            } else if !is_fixed && taffy::CompactLength::LENGTH_TAG == style.size.width.tag() {
+            } else if taffy::CompactLength::LENGTH_TAG == style.size.width.tag() {
                 columns.later_row_cell(*col, style.size.width.value());
             }
 
@@ -375,19 +441,31 @@ pub(crate) fn collect_table_cells(
     }
 }
 
-/// The `width` and `span` of a column element, whose span is clamped to
-/// 1 to 1000 as the HTML Standard does.
+/// The `width` and `span` of a column element.
 fn column_of(node: &Node) -> (Dimension, u16) {
     let width = node
         .primary_styles()
         .map_or_else(style_helpers::auto, |style| {
             stylo_taffy::convert::dimension(&style.get_position().width)
         });
-    let span = node
-        .attr(local_name!("span"))
-        .and_then(|val| val.parse::<u16>().ok())
-        .map_or(1, |v| v.clamp(1, 1000));
-    (width, span)
+    (width, node.attr(local_name!("span")).map_or(1, parse_span))
+}
+
+/// A column element's `span`: the HTML Standard's rules for parsing
+/// non-negative integers (leading white space, a `+`, then the digits up to
+/// the first other character), clamped to 1 to 1000; 1 where no digit
+/// leads.
+fn parse_span(value: &str) -> u16 {
+    let value = value.trim_start_matches([' ', '\t', '\n', '\u{c}', '\r']);
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let span = value
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0u32, |span, digit| {
+            span.saturating_mul(10)
+                .saturating_add(u32::from(digit - b'0'))
+        });
+    span.clamp(1, 1000) as u16
 }
 
 pub struct RangeIter(Range<usize>);
@@ -487,6 +565,167 @@ impl taffy::LayoutGridContainer for TableTreeWrapper<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Attribute, DocumentConfig, DocumentMutator, LocalName, QualName, ns};
+
+    /// An element: its name, its attributes, and its children.
+    struct El(
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        Vec<El>,
+    );
+
+    /// A cell with no padding holding `children`.
+    fn td(children: Vec<El>) -> El {
+        El("td", &[("style", "padding:0")], children)
+    }
+
+    /// A row of `cells` empty cells.
+    fn tr(cells: usize) -> El {
+        El("tr", &[], (0..cells).map(|_| td(vec![])).collect())
+    }
+
+    fn append(mutator: &mut DocumentMutator, parent: usize, el: &El, cells: &mut Vec<usize>) {
+        let attrs =
+            el.1.iter()
+                .map(|(name, value)| Attribute {
+                    name: QualName::new(None, ns!(), LocalName::from(*name)),
+                    value: value.to_string(),
+                })
+                .collect();
+        let id =
+            mutator.create_element(QualName::new(None, ns!(html), LocalName::from(el.0)), attrs);
+        mutator.append_children(parent, &[id]);
+        if el.0 == "td" {
+            cells.push(id);
+        }
+        for child in &el.2 {
+            append(mutator, id, child, cells);
+        }
+    }
+
+    /// The x and width of each cell, in document order, of a 400 px wide
+    /// table with no border spacing whose `col`s, `colgroup`s, and rows are
+    /// `parts`.
+    fn cells(table_layout: &'static str, parts: Vec<El>) -> Vec<(f32, f32)> {
+        let style: &'static [(&str, &str)] = match table_layout {
+            "fixed" => &[("style", "width:400px;border-spacing:0;table-layout:fixed")],
+            _ => &[("style", "width:400px;border-spacing:0")],
+        };
+        let mut doc = BaseDocument::new(DocumentConfig {
+            viewport: Some(blitz_traits::shell::Viewport::new(
+                800,
+                600,
+                1.0,
+                blitz_traits::shell::ColorScheme::Light,
+            )),
+            ..Default::default()
+        });
+        let page = El(
+            "html",
+            &[],
+            vec![El(
+                "body",
+                &[("style", "margin:0")],
+                vec![El("table", style, parts)],
+            )],
+        );
+        let mut ids = Vec::new();
+        {
+            let mut mutator = doc.mutate();
+            append(&mut mutator, 0, &page, &mut ids);
+        }
+        doc.resolve(0.0);
+        ids.iter()
+            .map(|&id| {
+                let layout = doc.nodes[id].final_layout;
+                (layout.location.x, layout.size.width)
+            })
+            .collect()
+    }
+
+    fn col(style: &'static [(&'static str, &'static str)]) -> El {
+        El("col", style, vec![])
+    }
+
+    #[test]
+    fn a_cell_after_a_colspan_sizes_the_column_it_starts_in() {
+        let first = El(
+            "tr",
+            &[],
+            vec![
+                El("td", &[("colspan", "2"), ("style", "padding:0")], vec![]),
+                El("td", &[("style", "padding:0;width:100px")], vec![]),
+            ],
+        );
+        let cells = cells("auto", vec![first, tr(3)]);
+        assert_eq!(cells[4], (300.0, 100.0));
+    }
+
+    #[test]
+    fn a_colgroup_without_cols_sizes_its_span_columns() {
+        let group = El(
+            "colgroup",
+            &[("span", "2"), ("style", "width:50px")],
+            vec![],
+        );
+        let cells = cells("fixed", vec![group, tr(3)]);
+        assert_eq!(&cells[..2], [(0.0, 50.0), (50.0, 50.0)]);
+    }
+
+    #[test]
+    fn a_col_span_is_read_as_html_reads_a_non_negative_integer() {
+        let cols = col(&[("span", "3px"), ("style", "width:40px")]);
+        let cells = cells("fixed", vec![cols, tr(4)]);
+        assert_eq!(&cells[..3], [(0.0, 40.0), (40.0, 40.0), (80.0, 40.0)]);
+    }
+
+    #[test]
+    fn a_narrow_col_grows_to_its_cells_min_content() {
+        let wide = El("div", &[("style", "width:100px;height:10px")], vec![]);
+        let row = El("tr", &[], vec![td(vec![wide]), td(vec![]), td(vec![])]);
+        let cols = vec![
+            col(&[("style", "width:5%")]),
+            col(&[("style", "width:57%")]),
+            col(&[("style", "width:38%")]),
+        ];
+        let cells = cells("auto", cols.into_iter().chain([row]).collect());
+        assert_eq!(cells, [(0.0, 100.0), (100.0, 180.0), (280.0, 120.0)]);
+    }
+
+    #[test]
+    fn a_short_last_row_keeps_the_columns_of_the_rows_before() {
+        let cols = vec![
+            col(&[("style", "width:20%")]),
+            col(&[("style", "width:30%")]),
+            col(&[("style", "width:50%")]),
+        ];
+        let cells = cells("auto", cols.into_iter().chain([tr(3), tr(1)]).collect());
+        assert_eq!(&cells[..3], [(0.0, 80.0), (80.0, 120.0), (200.0, 200.0)]);
+    }
+
+    #[test]
+    fn a_first_row_cell_wider_than_its_col_widens_the_column() {
+        let row = El(
+            "tr",
+            &[],
+            vec![
+                El("td", &[("style", "padding:0;width:200px")], vec![]),
+                td(vec![]),
+            ],
+        );
+        let cells = cells("auto", vec![col(&[("style", "width:100px")]), row]);
+        assert_eq!(cells, [(0.0, 200.0), (200.0, 200.0)]);
+    }
+
+    #[test]
+    fn col_percentages_past_the_table_are_cut_from_the_last() {
+        let cols = vec![
+            col(&[("style", "width:60%")]),
+            col(&[("style", "width:60%")]),
+        ];
+        let cells = cells("auto", cols.into_iter().chain([tr(2)]).collect());
+        assert_eq!(cells, [(0.0, 240.0), (240.0, 160.0)]);
+    }
 
     fn cell() -> TableItem {
         TableItem {
@@ -498,14 +737,14 @@ mod tests {
 
     #[test]
     fn a_column_elements_width_comes_before_its_first_row_cells() {
-        let mut columns = ColumnWidths::default();
+        let mut columns = ColumnWidths::new(false);
         columns.add_columns(Dimension::percent(0.14), 1);
         columns.add_columns(Dimension::auto(), 1);
         columns.first_row_cell(0, Dimension::length(50.0));
         columns.first_row_cell(1, Dimension::length(30.0));
         columns.first_row_cell(2, Dimension::length(20.0));
         assert_eq!(
-            columns.into_tracks(3),
+            columns.widths,
             [
                 Dimension::percent(0.14),
                 Dimension::length(30.0),
@@ -516,13 +755,13 @@ mod tests {
 
     #[test]
     fn a_column_elements_span_sizes_as_many_columns() {
-        let mut columns = ColumnWidths::default();
+        let mut columns = ColumnWidths::new(false);
         columns.add_columns(Dimension::length(40.0), 2);
         for col in 0..3 {
             columns.first_row_cell(col, Dimension::auto());
         }
         assert_eq!(
-            columns.into_tracks(3),
+            columns.widths,
             [
                 Dimension::length(40.0),
                 Dimension::length(40.0),
@@ -533,17 +772,33 @@ mod tests {
 
     #[test]
     fn a_first_row_cell_sizes_the_column_it_starts_in() {
-        let mut columns = ColumnWidths::default();
+        let mut columns = ColumnWidths::new(false);
         columns.first_row_cell(0, Dimension::length(50.0));
         columns.first_row_cell(2, Dimension::length(30.0));
         assert_eq!(
-            columns.into_tracks(3),
+            columns.widths,
             [
                 Dimension::length(50.0),
                 Dimension::auto(),
                 Dimension::length(30.0)
             ]
         );
+    }
+
+    #[test]
+    fn a_first_row_cell_wider_than_its_col_widens_it_in_the_automatic_layout_only() {
+        for (fixed, width) in [(false, 200.0), (true, 100.0)] {
+            let mut columns = ColumnWidths::new(fixed);
+            columns.add_columns(Dimension::length(100.0), 1);
+            columns.first_row_cell(0, Dimension::length(200.0));
+            assert_eq!(columns.widths, [Dimension::length(width)], "fixed: {fixed}");
+        }
+    }
+
+    #[test]
+    fn a_span_is_parsed_as_a_non_negative_integer_from_1_to_1000() {
+        let spans = ["3", "3px", " +2", "70000", "0", "x", ""].map(parse_span);
+        assert_eq!(spans, [3, 3, 2, 1000, 1, 1, 1]);
     }
 
     #[test]
